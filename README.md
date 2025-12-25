@@ -1,6 +1,6 @@
 # Multi-lingual-Virtual-Search-Keyboard
 
-Designed for Delphi 7, this minimal-dependency (only GDI+) virtual keyboard.
+Designed for Delphi 7, this minimal-dependency (only GDI+) virtual search keyboard.
 
 Integrates with layered forms and GDI+ to render elements with transparency effects (see screenshot).
 
