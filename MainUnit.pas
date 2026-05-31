@@ -24,9 +24,11 @@ type
     procedure AppMessage(var Msg: TMsg; var Handled: Boolean);
   public
     { Public declarations }
-    bgColor : TRGBAColor;
+    bgColor  : TRGBAColor;
+    bgTColor : TColor;
     MyBackgroundBitmap : TBitmap;
     procedure SubmitSearch(Sender: TObject; const Query: WideString);
+    procedure CancelKeyboard(Sender: TObject; const CurrentText: WideString);
     procedure UpdateLayeredWindow;
   end;
 
@@ -42,7 +44,7 @@ const
   keyboardH : Integer = 400;
 
 var
-  VK    : TVKRenderer;
+  VK     : TVKRenderer;
   VKForm : TVKForm;
 
 
@@ -60,6 +62,25 @@ begin
 end;
 
 
+procedure TVKForm.CancelKeyboard(Sender: TObject; const CurrentText: WideString);
+begin
+  if CurrentText <> '' then
+  begin
+    if VK <> nil then
+    begin
+      VK.SetSelection(0, Length(VK.Text));
+      VK.DeleteSelection;
+    end;
+  end
+  else
+  begin
+    if VK <> nil then
+      VK.Closing := True;
+    Close;
+  end;
+end;
+
+
 procedure TVKForm.AppMessage(var Msg: TMsg; var Handled: Boolean);
 var
   UnicodeMsg: TMsg;
@@ -71,7 +92,10 @@ begin
     If Msg.wParam <> 27 then
     Begin
       WC := WideChar(Msg.wParam);
+      //ShowMessage(IntToStr(Msg.wParam));
+      if (VK = nil) or VK.Closing then Exit;
       VK.WideKeyPress(WC);
+      if (VK = nil) or VK.Closing then Exit;
 
       VK.DrawInputFieldArea;
       VK.DrawKeyboardArea;
@@ -85,10 +109,15 @@ end;
 
 procedure TVKForm.FormCreate(Sender: TObject);
 begin
-  bgColor.R :=   0;
+  bgColor.R := 160;
   bgColor.G :=   0;
   bgColor.B :=   0;
   bgColor.A := 215;
+
+  bgTColor :=   0+         // Blue
+                0 shl  8+  // Green
+              160 shl 16+  // Red
+              215 shl 24;  // Alpha
 
   SetWindowLong(Handle, GWL_EXSTYLE, GetWindowLong(Handle, GWL_EXSTYLE) or WS_EX_LAYERED);
 
@@ -101,14 +130,14 @@ begin
   MyBackgroundBitmap.Height := 720;
   //sFillRect32(MyBackgroundBitmap,0,0,1280,720,Cardinal(bgColor));
 
-  VK := TVKRenderer.Create;
+  VK := TVKRenderer.Create(vfInput, True);
 
   // Your 32bit background bitmap (pf32bit) used as render target
-  VK.SetTargetBitmap(MyBackgroundBitmap,bgColor);
+  VK.SetTargetBitmap(MyBackgroundBitmap,bgColor,False);
 
   // Set rectangles (in bitmap coordinates)
-  VK.SetInputRect(Rect(inputX, inputY, inputX+inputW-1,inputY+inputH-1));
-  VK.SetKeyLayoutRect(Rect(keyboardX,keyboardY,keyboardX+keyboardW-1,keyboardY+keyboardH-1));
+  VK.SetInputRect(Rect(inputX, inputY, inputX+inputW-1,inputY+inputH-1),False);
+  VK.SetKeyLayoutRect(Rect(keyboardX,keyboardY,keyboardX+keyboardW-1,keyboardY+keyboardH-1),True);
 
   // Optional: tweak spacing
   //VK.KeyMarginXFrac := 0.012;
@@ -116,20 +145,23 @@ begin
 
   // Optional: events
   VK.OnSubmit := SubmitSearch;
+  VK.OnCancel := CancelKeyboard;
 end;
 
 
 procedure TVKForm.FormDestroy(Sender: TObject);
 begin
-  MyBackgroundBitmap.Free;
-  VK.Free;
+  FreeAndNil(MyBackgroundBitmap);
+  FreeAndNil(VK);
 end;
 
 
 procedure TVKForm.FormMouseDown(Sender: TObject; Button: TMouseButton;
   Shift: TShiftState; X, Y: Integer);
 begin
+  if (VK = nil) or VK.Closing then Exit;
   VK.MouseDown(X, Y, Button);
+  if (VK = nil) or VK.Closing then Exit;
 
   // Redraw background area(s):
   VK.DrawInputFieldArea;
@@ -146,9 +178,10 @@ end;
 
 procedure TVKForm.FormMouseMove(Sender: TObject; Shift: TShiftState; X, Y: Integer);
 begin
-  If Shift = [ssLeft] then
+  If (VK <> nil) and (not VK.Closing) and (Shift = [ssLeft]) then
   Begin
     VK.MouseMove(X, Y, Shift);
+    if (VK = nil) or VK.Closing then Exit;
     VK.DrawInputFieldArea;
     UpdateLayeredWindow;
   End;
@@ -158,7 +191,9 @@ end;
 procedure TVKForm.FormMouseUp(Sender: TObject; Button: TMouseButton;
   Shift: TShiftState; X, Y: Integer);
 begin
+  if (VK = nil) or VK.Closing then Exit;
   VK.MouseUp(X, Y, Button);
+  if (VK = nil) or VK.Closing then Exit;
   VK.DrawInputFieldArea;
   UpdateLayeredWindow;
 end;
@@ -168,6 +203,7 @@ procedure TVKForm.FormKeyDown(Sender: TObject; var Key: Word; Shift: TShiftState
 var
   I, iTS : Cardinal;
 begin
+  if (VK = nil) or VK.Closing then Exit;
   // Benchmark
   {$IFDEF BENCHMARK}
   If Key = VK_HOME then
@@ -183,6 +219,7 @@ begin
   {$ENDIF}
 
   VK.KeyDown(Key, Shift);
+  if (VK = nil) or VK.Closing then Exit;
   VK.DrawInputFieldArea;
   VK.DrawKeyboardArea;
 
@@ -220,10 +257,13 @@ end;
 procedure TVKForm.FormShow(Sender: TObject);
 begin
   // Clear Background
-  sFillRect32(MyBackgroundBitmap,0,0,1280,720,Cardinal(bgColor));
+  sFillRect32(MyBackgroundBitmap,0,0,1280,720,bgTColor);
 
-  VK.DrawInputFieldArea;
-  VK.DrawKeyboardArea;
+  if (VK <> nil) and (not VK.Closing) then
+  begin
+    VK.DrawInputFieldArea;
+    VK.DrawKeyboardArea;
+  end;
   UpdateLayeredWindow;
 end;
 

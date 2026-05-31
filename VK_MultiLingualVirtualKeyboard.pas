@@ -1,3 +1,4 @@
+{.$DEFINE TRACEDEBUG}
 unit VK_MultiLingualVirtualKeyboard;
 
 {
@@ -38,12 +39,18 @@ interface
 
 uses
   Windows, Messages, SysUtils, Classes, Graphics, Controls, Forms, Math, Clipbrd,
-  GDIPAPI, GDIPOBJ;
+  GDIPAPI, GDIPOBJ
+  {$IFDEF TRACEDEBUG},DebugUnit{$ENDIF};
+
 
 const
   VK_OEM_COMMA  = $BC; // For any country/region, the Comma and Less Than key
   VK_OEM_PERIOD = $BE; // For any country/region, the Period and Greater Than key
   VK_OEM_2      = $BF; // It can vary by keyboard. For the US ANSI keyboard, the Forward Slash and Question Mark key
+
+  {$IFDEF TRACEDEBUG}
+  VKLogFile     : WideString = 'c:\log\.VirtualKeyboard.txt';
+  {$ENDIF}
 
 type
   TABCFLOAT = packed record
@@ -65,13 +72,15 @@ type
     kkSymbols,    // Toggles symbols page
     kkSpace,      // Inserts space
     kkSubmit,     // Submit/search action
+    kkCancel,     // Cancel action
     kkLang        // Switch keyboard layout HKL
   );
 
   // Focus model for keyboard navigation (input field vs key layout).
   TVKFocus = (
     vfInput,
-    vfKeys
+    vfKeys,
+    vfNone
   );
 
   TVKKey = class
@@ -94,8 +103,37 @@ type
   end;
 
   TVKOnSubmit = procedure(Sender: TObject; const Query: WideString) of object;
+  TVKOnCancel = procedure(Sender: TObject; const CurrentText: WideString) of object;
   TVKOnLayoutChanged = procedure(Sender: TObject; NewHKL: HKL) of object;
   TVKOnTextChanged = procedure(Sender: TObject; const NewText: WideString) of object;
+
+  TVKRendererState = class
+  public
+    Version: Integer;
+
+    // Layout identity (for restore with fallback)
+    SavedHKL   : HKL;
+    SavedLangID: Word;        // LOWORD(HKL)
+    SavedKLID  : AnsiString;  // '00000409' etc (GetKeyboardLayoutName)
+
+    // Keyboard state
+    Page  : TVKPage;
+    Shift : Boolean;
+    Focus : TVKFocus;
+
+    // Focused and "active" key preservation (signature-based)
+    FocusedKeyValid: Boolean;
+    FocusedKeySig  : TVKKeySignature;
+
+    ActiveKeyValid: Boolean;
+    ActiveKeySig  : TVKKeySignature;
+
+    // Input state
+    Text     : WideString;
+    CaretPos : Integer;
+    SelAnchor: Integer;
+    ScrollX  : Single;
+  end;
 
   TVKRenderer = class
   private
@@ -116,23 +154,25 @@ type
     FInputMarginYFrac: Single;
 
     // Round-rect corner radius fractions (default 0.25 of element height)
-    FRadiusFracLayout: Single;
-    FRadiusFracInput: Single;
-    FRadiusFracKey: Single;
+    FRadiusFracLayout  : Single;
+    FRadiusFracInput    : Single;
+    FRadiusFracKey      : Single;
 
     // Colors (RGBA)
-    FColLayoutBg: TRGBAColor;
-    FColInputBg: TRGBAColor;
-    FColInputBgInactive: TRGBAColor;
-    FColKeyBg: TRGBAColor;
-    FColInputFont: TRGBAColor;
-    FColKeyFont: TRGBAColor;
-    FColSelBg: TRGBAColor;
-    FColSelFont: TRGBAColor;
-    FCaretColor: TRGBAColor;
+    FColLayoutBg        : TRGBAColor;
+    FColInputBg         : TRGBAColor;
+    FColInputBgInactive : TRGBAColor;
+    FColKeyBg           : TRGBAColor;
+    FColKeyBgFocused    : TRGBAColor;
+    FColInputFont       : TRGBAColor;
+    FColKeyFont         : TRGBAColor;
+    FColKeyFontFocused  : TRGBAColor;
+    FColSelBg           : TRGBAColor;
+    FColSelFont         : TRGBAColor;
+    FCaretColor         : TRGBAColor;
 
     // Target background color (used to pre-compose caches for SourceCopy blits).
-    FTargetBg: TRGBAColor;
+    FTargetBg           : TRGBAColor;
 
     // Cached round-rect bitmaps (performance)
     // Cached elements list:
@@ -166,7 +206,6 @@ type
     // Cache base backgrounds (used to build caches deterministically for SourceCopy blits)
     FCacheLayoutBaseBg: TRGBAColor;
     FCacheInputBaseBg: TRGBAColor;
-    FCacheKeyBaseBg: TRGBAColor;
 
     // State
     FPage: TVKPage;
@@ -186,8 +225,10 @@ type
     FKeyFont: TGPFont;
     FKeyFmt : TGPStringFormat;
     FKeyBrush : TGPSolidBrush;
+    FKeyBrushFocused : TGPSolidBrush;
     FKeyFontPxCache: Integer;
     FKeyFontColorCache: TRGBAColor;
+    FKeyFontFocusedColorCache: TRGBAColor;
 
     // Cache GDI+ font, format, brushes across frames (input)
     FInputFont: TGPFont;
@@ -238,8 +279,17 @@ type
 
     // Events
     FOnSubmit: TVKOnSubmit;
+    FOnCancel: TVKOnCancel;
     FOnLayoutChanged: TVKOnLayoutChanged;
     FOnTextChanged: TVKOnTextChanged;
+
+    FShowCancelButton: Boolean;
+    FClosing: Boolean;
+
+    // Double Click to select
+    FLastClickTick    : DWORD;
+    FLastClickPos     : TPoint;
+    FLastClickInInput : Boolean;
 
   private
     class function RGBA(r, g, b, a: Byte): TRGBAColor;
@@ -259,6 +309,9 @@ type
     procedure FreeCaches;
     function  CalcKeyRowHeightPx(Rows: Integer): Integer;
     function  BuildRoundRectCache(W, H: Integer; RadiusFrac: Single; const UnderColor, BaseBgColor, FillColor: TRGBAColor; UseUnder : Boolean): TBitmap;
+    function  BuildRoundRectCacheWithPath(W, H: Integer; const UnderColor, BaseBgColor, FillColor: TRGBAColor; UseUnder: Boolean; Path: TGPGraphicsPath): TBitmap;
+
+
     procedure EnsureCaches; // rebuilds caches when size/color/radius/margins change
 
     // Text resources caching helpers
@@ -278,10 +331,11 @@ type
     procedure UpdateKeyCaptionsForHKL;
 
     // VK to Unicode
-    function VkToUnicode(const Vk: UINT; ShiftDown: Boolean; Layout: HKL): WideString;
+    function  VkToUnicode(const Vk: UINT; ShiftDown: Boolean; Layout: HKL): WideString;
 
     // Hit testing
-    function HitTestKey(X, Y: Integer): TVKKey;
+    function  HitTestKey(X, Y: Integer): TVKKey;
+    function  IsInputDoubleClick(X, Y: Integer): Boolean;
 
     // Input editing helpers
     procedure NormalizeSelection;
@@ -308,7 +362,7 @@ type
     procedure PasteFromClipboard;
 
     // Key focus navigation helpers (arrow navigation on the key layout).
-    procedure SetFocus(AFocus: TVKFocus);
+    procedure SetShowCancelButton(Value: Boolean);
     function FirstVisibleKeyIndex: Integer;
     function AnyKeyHasLayout: Boolean;
     procedure EnsureFocusedKeyValid;
@@ -316,7 +370,7 @@ type
     procedure GetRowStartCount(Row: Integer; out StartIdx, Count: Integer);
     function GetKeyRowFromIndex(Index: Integer): Integer;
     function FindClosestKeyInRow(Row: Integer; RefCenterX: Single): Integer;
-    procedure FocusKeyClosestToCaret;
+    procedure FocusKeyClosestToCaret(TargetRow: Integer);
     procedure MoveFocusedKeyUpDown(DeltaRow: Integer);
     procedure MoveFocusedKeyLeftRight(DeltaCol: Integer);
 
@@ -329,16 +383,23 @@ type
     // Unify mouse click and keyboard "Enter" activation.
     procedure ActivateKey(K: TVKKey);
 
+    function GetCurrentKLID: AnsiString;
+    function FindInstalledHKLByKLID(const KLID: AnsiString; out Found: HKL): Boolean;
+    function ResolveHKLFromState(State: TVKRendererState): HKL;
   public
-    constructor Create;
+    constructor Create(const Focus : TVKFocus; ShowCancelButton: Boolean = False);
     destructor Destroy; override;
 
     // Initialization
-    procedure SetTargetBitmap(ABitmap: TBitmap; const ABackground: TRGBAColor); // must be 32bit with alpha
-    procedure SetKeyLayoutRect(const R: TRect);
-    procedure SetInputRect(const R: TRect);
+    procedure SetTargetBitmap(ABitmap: TBitmap; const ABackground: TRGBAColor; UpdateCache : Boolean); // must be 32bit with alpha
+    procedure SetKeyLayoutRect(const R: TRect; UpdateCache : Boolean);
+    function  GetLayoutRect : TRect;
+    procedure SetInputRect(const R: TRect; UpdateCache : Boolean);
+    function  GetInputRect : TRect;
 
     // Layout parameters
+    procedure SetFocus(AFocus: TVKFocus);
+
     property KeyMarginXFrac: Single read FKeyMarginXFrac write FKeyMarginXFrac;
     property KeyMarginYFrac: Single read FKeyMarginYFrac write FKeyMarginYFrac;
     property KeyPadXFrac: Single read FKeyPadXFrac write FKeyPadXFrac;
@@ -355,8 +416,10 @@ type
     property ColLayoutBg: TRGBAColor read FColLayoutBg write FColLayoutBg;
     property ColInputBg: TRGBAColor read FColInputBg write FColInputBg;
     property ColKeyBg: TRGBAColor read FColKeyBg write FColKeyBg;
+    property ColKeyBgFocused:TRGBAColor read FColKeyBgFocused write FColKeyBgFocused;
     property ColInputFont: TRGBAColor read FColInputFont write FColInputFont;
     property ColKeyFont: TRGBAColor read FColKeyFont write FColKeyFont;
+    property ColKeyFontFocused: TRGBAColor read FColKeyFontFocused write FColKeyFontFocused;
 
     property ColSelBg: TRGBAColor read FColSelBg write FColSelBg;
     property ColSelFont: TRGBAColor read FColSelFont write FColSelFont;
@@ -364,7 +427,8 @@ type
     property ColInputBgInactive: TRGBAColor read FColInputBgInactive write FColInputBgInactive;
 
     // Input access
-    property Text: WideString read FText;
+    procedure SetText(const Value: WideString);
+    property Text: WideString read FText write SetText;
     property CaretPos: Integer read FCaretPos;
     property SelStart: Integer read FSelStart;
     property SelLen: Integer read FSelLen;
@@ -390,14 +454,22 @@ type
 
     // Optional events
     property OnSubmit: TVKOnSubmit read FOnSubmit write FOnSubmit;
+    property OnCancel: TVKOnCancel read FOnCancel write FOnCancel;
     property OnLayoutChanged: TVKOnLayoutChanged read FOnLayoutChanged write FOnLayoutChanged;
     property OnTextChanged: TVKOnTextChanged read FOnTextChanged write FOnTextChanged;
+
+    property ShowCancelButton: Boolean read FShowCancelButton write SetShowCancelButton;
+    property Closing: Boolean read FClosing write FClosing;
 
     // Utility (direct editing)
     procedure SetSelection(StartIdx, Len: Integer);
     procedure ReplaceSelection(const S: WideString);
     procedure DeleteSelection;
     procedure SwitchToNextLayout;
+
+    // Save/restore states
+    function SaveState(ForceBuild: Boolean = False): TVKRendererState;
+    procedure RestoreState(State: TVKRendererState; FireEvents: Boolean = False);
   end;
 
   PHKL = ^HKL;
@@ -634,7 +706,7 @@ begin
   // Reset cache base backgrounds.
   FillChar(FCacheLayoutBaseBg, SizeOf(FCacheLayoutBaseBg), 0);
   FillChar(FCacheInputBaseBg, SizeOf(FCacheInputBaseBg), 0);
-  FillChar(FCacheKeyBaseBg, SizeOf(FCacheKeyBaseBg), 0);
+  //FillChar(FCacheKeyBaseBg, SizeOf(FCacheKeyBaseBg), 0);
 end;
 
 function TVKRenderer.CalcKeyRowHeightPx(Rows: Integer): Integer;
@@ -659,58 +731,72 @@ begin
 end;
 
 
-function TVKRenderer.BuildRoundRectCache(W, H: Integer; RadiusFrac: Single; const UnderColor, BaseBgColor, FillColor: TRGBAColor; UseUnder : Boolean): TBitmap;
+function TVKRenderer.BuildRoundRectCache(W, H: Integer; RadiusFrac: Single; const UnderColor, BaseBgColor, FillColor: TRGBAColor; UseUnder: Boolean ): TBitmap;
 var
-  Bmp: TBitmap;
-  G: TGPGraphics;
   RF: TGPRectF;
   RadiusPx: Single;
   P: TGPGraphicsPath;
-  B: TGPSolidBrush;
 begin
   Result := nil;
   if (W <= 0) or (H <= 0) then Exit;
 
-  // Build cached round-rect
-  // The cache is pre-composed so the final blit can use SourceCopy.
+  RF.X      := 0;
+  RF.Y      := 0;
+  RF.Width  := W-1;
+  RF.Height := H-1;
+
+  RadiusPx := Max(0, RadiusFrac) * RF.Height;
+
+  P := CreateRoundRectPath(RF, RadiusPx);
+  try
+    Result := BuildRoundRectCacheWithPath(W, H, UnderColor, BaseBgColor, FillColor, UseUnder, P);
+  finally
+    P.Free;
+  end;
+end;
+
+
+function TVKRenderer.BuildRoundRectCacheWithPath(W, H: Integer; const UnderColor, BaseBgColor, FillColor: TRGBAColor; UseUnder: Boolean; Path: TGPGraphicsPath): TBitmap;
+var
+  Bmp: TBitmap;
+  G: TGPGraphics;
+  B: TGPSolidBrush;
+begin
+  Result := nil;
+  if (W <= 0) or (H <= 0) or (Path = nil) then Exit;
+
   Bmp := TBitmap.Create;
   Bmp.PixelFormat := pf32bit;
-  Bmp.Width  := W;
+  Bmp.Width := W;
   Bmp.Height := H;
 
   G := TGPGraphics.Create(Bmp.Canvas.Handle);
   try
     G.SetCompositingQuality(CompositingQualityHighQuality);
 
-    If UseUnder = True then
-    Begin
-      sFillRect32(Bmp,0,0,W,H,GPColor(UnderColor));
+    if UseUnder = True then
+    begin
+      sFillRect32(Bmp, 0, 0, W, H, GPColor(UnderColor));
       B := TGPSolidBrush.Create(GPColor(BaseBgColor));
-      G.FillRectangle(B,0,0,W,H);
-      B.Free;
-    End
-      else
-    Begin
-      sFillRect32(Bmp,0,0,W,H,GPColor(BaseBgColor));
-    End;
-
-    RF.X      := 0;
-    RF.Y      := 0;
-    RF.Width  := W-1;
-    RF.Height := H-1;
-
-    RadiusPx := Max(0, RadiusFrac) * RF.Height;
-
-    P := CreateRoundRectPath(RF, RadiusPx);
-    try
-      B := TGPSolidBrush.Create(GPColor(FillColor));
       try
-        G.FillPath(B, P);
+        G.FillRectangle(B, 0, 0, W, H);
       finally
         B.Free;
       end;
+    end
+      else
+    begin
+      sFillRect32(Bmp, 0, 0, W, H, GPColor(BaseBgColor));
+    end;
+
+    // Must set after base fill, otherwise anti-aliased frame appears
+    G.SetSmoothingMode(SmoothingModeAntiAlias);
+
+    B := TGPSolidBrush.Create(GPColor(FillColor));
+    try
+      G.FillPath(B, Path);
     finally
-      P.Free;
+      B.Free;
     end;
 
   finally
@@ -728,9 +814,18 @@ var
   KW: Integer;
   KH4, KH5: Integer;
   NeedLayout, NeedInput, NeedKey: Boolean;
-  HighlightCol: TRGBAColor;
-  KeyBaseBg: TRGBAColor;
+
+  InputRF: TGPRectF;
+  InputRadiusPx: Single;
+  InputPath: TGPGraphicsPath;
+
+  KeyRF: TGPRectF;
+  KeyRadiusPx: Single;
+  KeyPath4: TGPGraphicsPath;
+  KeyPath5: TGPGraphicsPath;
+
 begin
+  {$IFDEF TRACEDEBUG}DebugMSGFT(VKLogFile,'EnsureCaches (before)');{$ENDIF}
   // Caches are rebuilt only when their effective parameters changed.
   // This keeps draw loops fast and avoids re-creating GDI+ paths per frame.
 
@@ -749,23 +844,30 @@ begin
      (not SameRGBA(FCacheLayoutBaseBg, FTargetBg)) or
      (Abs(FCacheRadiusLayout - FRadiusFracLayout) > 0.00001));
 
-  if NeedLayout then
-  begin
-    if FCacheLayoutRR <> nil then FreeAndNil(FCacheLayoutRR);
-    FCacheLayoutRR := BuildRoundRectCache(LW, LH, FRadiusFracLayout, FTargetBg, FTargetBg, FColLayoutBg, False);
+  {$IFDEF TRACEDEBUG}DebugMSGFT(VKLogFile,'Layout needed : '+BoolToStr(NeedLayout,True));{$ENDIF}
 
-    FCacheLayoutW := LW;
-    FCacheLayoutH := LH;
-    FCacheLayoutCol := FColLayoutBg;
+  If NeedLayout = True then
+  Begin
+    If FCacheLayoutRR <> nil then
+      FreeAndNil(FCacheLayoutRR);
+
+    FCacheLayoutRR     := BuildRoundRectCache(LW, LH, FRadiusFracLayout, FTargetBg, FTargetBg, FColLayoutBg, False);
+    
+    FCacheLayoutW      := LW;
+    FCacheLayoutH      := LH;
+    FCacheLayoutCol    := FColLayoutBg;
     FCacheLayoutBaseBg := FTargetBg;
     FCacheRadiusLayout := FRadiusFracLayout;
-  end
-  else if (LW <= 0) or (LH <= 0) then
-  begin
-    if FCacheLayoutRR <> nil then FreeAndNil(FCacheLayoutRR);
+  End
+    else
+  If (LW <= 0) or (LH <= 0) then
+  Begin
+    If FCacheLayoutRR <> nil then
+      FreeAndNil(FCacheLayoutRR);
+
     FCacheLayoutW := 0;
     FCacheLayoutH := 0;
-  end;
+  End;
 
   // 2) Input background cache (focused + unfocused)
   NeedInput :=
@@ -777,22 +879,37 @@ begin
      (not SameRGBA(FCacheInputBaseBg, FTargetBg)) or
      (Abs(FCacheRadiusInput - FRadiusFracInput) > 0.00001));
 
+  {$IFDEF TRACEDEBUG}DebugMSGFT(VKLogFile,'Input needed : '+BoolToStr(NeedInput,True));{$ENDIF}
+
   if NeedInput then
   begin
-    if FCacheInputRRFocused <> nil then FreeAndNil(FCacheInputRRFocused);
-    if FCacheInputRRUnfocused <> nil then FreeAndNil(FCacheInputRRUnfocused);
+    if FCacheInputRRFocused <> nil then
+      FreeAndNil(FCacheInputRRFocused);
+    if FCacheInputRRUnfocused <> nil then
+      FreeAndNil(FCacheInputRRUnfocused);
 
-    FCacheInputRRFocused   := BuildRoundRectCache(IW, IH, FRadiusFracInput, FTargetBg, FTargetBg, FColInputBg, False);
-    FCacheInputRRUnfocused := BuildRoundRectCache(IW, IH, FRadiusFracInput, FTargetBg, FTargetBg, FColInputBgInactive, False);
+    InputRF.X      := 0;
+    InputRF.Y      := 0;
+    InputRF.Width  := IW-1;
+    InputRF.Height := IH-1;
+    InputRadiusPx  := Max(0, FRadiusFracInput) * InputRF.Height;
+    InputPath      := CreateRoundRectPath(InputRF, InputRadiusPx);
+    try
+      FCacheInputRRFocused   := BuildRoundRectCacheWithPath(IW, IH, FTargetBg, FTargetBg, FColInputBg, False, InputPath);
+      FCacheInputRRUnfocused := BuildRoundRectCacheWithPath(IW, IH, FTargetBg, FTargetBg, FColInputBgInactive, False, InputPath);
+    finally
+      InputPath.Free;
+    end;
 
-    FCacheInputW := IW;
-    FCacheInputH := IH;
-    FCacheInputColFocused := FColInputBg;
+    FCacheInputW            := IW;
+    FCacheInputH            := IH;
+    FCacheInputColFocused   := FColInputBg;
     FCacheInputColUnfocused := FColInputBgInactive;
-    FCacheInputBaseBg := FTargetBg;
-    FCacheRadiusInput := FRadiusFracInput;
+    FCacheInputBaseBg       := FTargetBg;
+    FCacheRadiusInput       := FRadiusFracInput;
   end
-  else if (IW <= 0) or (IH <= 0) then
+    else
+  if (IW <= 0) or (IH <= 0) then
   begin
     if FCacheInputRRFocused <> nil then FreeAndNil(FCacheInputRRFocused);
     if FCacheInputRRUnfocused <> nil then FreeAndNil(FCacheInputRRUnfocused);
@@ -805,21 +922,11 @@ begin
   KW := LW;
   KH4 := 0;
   KH5 := 0;
-  if (KW > 0) and (LH > 0) then
-  begin
+  If (KW > 0) and (LH > 0) then
+  Begin
     KH4 := CalcKeyRowHeightPx(4);
     KH5 := CalcKeyRowHeightPx(5);
-  end;
-
-  HighlightCol := RGBA(255, 0, 0, 255);
-
-  // For keys, the base background is the target background blended with the layout round-rect color.
-  // This matches the pixels already present inside the keyboard layout area after its cache is blitted.
-  KeyBaseBg := BlendRGBA_Over(FTargetBg, FColLayoutBg);
-  {KeyBaseBg.R := (FTargetBg.R+FColLayoutBg.R) div 2;
-  KeyBaseBg.G := (FTargetBg.G+FColLayoutBg.G) div 2;
-  KeyBaseBg.B := (FTargetBg.B+FColLayoutBg.B) div 2;
-  KeyBaseBg.A := (FTargetBg.A+FColLayoutBg.A) div 2;}
+  End;
 
   NeedKey :=
     (KW > 0) and (KH4 > 0) and (KH5 > 0) and
@@ -828,48 +935,86 @@ begin
      (FCacheKeyW <> KW) or
      (FCacheKeyH4 <> KH4) or (FCacheKeyH5 <> KH5) or
      (not SameRGBA(FCacheKeyColDefault, FColKeyBg)) or
-     (not SameRGBA(FCacheKeyColFocused, HighlightCol)) or
-     (not SameRGBA(FCacheKeyBaseBg, KeyBaseBg)) or
+     (not SameRGBA(FCacheKeyColFocused, FColKeyBgFocused)) or
      (Abs(FCacheRadiusKey - FRadiusFracKey) > 0.00001) or
      (Abs(FCacheKeyMarginYFrac - FKeyMarginYFrac) > 0.00001));
 
-  if NeedKey then
-  begin
-    if FCacheKeyRR4Default <> nil then FreeAndNil(FCacheKeyRR4Default);
-    if FCacheKeyRR4Focused <> nil then FreeAndNil(FCacheKeyRR4Focused);
-    if FCacheKeyRR5Default <> nil then FreeAndNil(FCacheKeyRR5Default);
-    if FCacheKeyRR5Focused <> nil then FreeAndNil(FCacheKeyRR5Focused);
+  {$IFDEF TRACEDEBUG}DebugMSGFT(VKLogFile,'Key needed : '+BoolToStr(NeedKey,True));{$ENDIF}
+
+  If NeedKey = True then
+  Begin
+    if FCacheKeyRR4Default <> nil then
+      FreeAndNil(FCacheKeyRR4Default);
+    if FCacheKeyRR4Focused <> nil then
+      FreeAndNil(FCacheKeyRR4Focused);
+    if FCacheKeyRR5Default <> nil then
+      FreeAndNil(FCacheKeyRR5Default);
+    if FCacheKeyRR5Focused <> nil then
+      FreeAndNil(FCacheKeyRR5Focused);
+
 
     // Key caches are "max width" (layout width). Per-key render uses 2 DrawImage calls:
     // - copy left portion (cropped to key width)
     // - patch right cap (cropped from cache right edge)
     // The cache is pre-composed so the final blit can use SourceCopy.
-    FCacheKeyRR4Default := BuildRoundRectCache(KW, KH4, FRadiusFracKey, FTargetBg, FColLayoutBg, FColKeyBg, True);
-    FCacheKeyRR4Focused := BuildRoundRectCache(KW, KH4, FRadiusFracKey, FTargetBg, FColLayoutBg, HighlightCol, True);
+    KeyPath4 := nil;
+    KeyPath5 := nil;
+    try
+      // 4-row key cache path (shared by Default + Focused)
+      KeyRF.X      := 0;
+      KeyRF.Y      := 0;
+      KeyRF.Width  := KW - 1;
+      KeyRF.Height := KH4 - 1;
 
-    FCacheKeyRR5Default := BuildRoundRectCache(KW, KH5, FRadiusFracKey, FTargetBg, FColLayoutBg, FColKeyBg, True);
-    FCacheKeyRR5Focused := BuildRoundRectCache(KW, KH5, FRadiusFracKey, FTargetBg, FColLayoutBg, HighlightCol, True);
+      If KeyRF.Height < KeyRF.Width then
+        KeyRadiusPx  := Max(0, FRadiusFracKey) * KeyRF.Height else
+        KeyRadiusPx  := Max(0, FRadiusFracKey) * KeyRF.Width;
 
-    FCacheKeyW  := KW;
-    FCacheKeyH4 := KH4;
-    FCacheKeyH5 := KH5;
-    FCacheKeyColDefault := FColKeyBg;
-    FCacheKeyColFocused := HighlightCol;
-    FCacheKeyBaseBg := KeyBaseBg;
-    FCacheRadiusKey := FRadiusFracKey;
+      KeyPath4     := CreateRoundRectPath(KeyRF, KeyRadiusPx);
+
+      FCacheKeyRR4Default := BuildRoundRectCacheWithPath(KW, KH4, FTargetBg, FColLayoutBg, FColKeyBg       , True, KeyPath4);
+      FCacheKeyRR4Focused := BuildRoundRectCacheWithPath(KW, KH4, FTargetBg, FColLayoutBg, FColKeyBgFocused, True, KeyPath4);
+
+      // 5-row key cache path (shared by Default + Focused)
+      KeyRF.X      := 0;
+      KeyRF.Y      := 0;
+      KeyRF.Width  := KW - 1;
+      KeyRF.Height := KH5 - 1;
+      KeyRadiusPx  := Max(0, FRadiusFracKey) * KeyRF.Height;
+      KeyPath5     := CreateRoundRectPath(KeyRF, KeyRadiusPx);
+
+      FCacheKeyRR5Default := BuildRoundRectCacheWithPath(KW, KH5, FTargetBg, FColLayoutBg, FColKeyBg       , True, KeyPath5);
+      FCacheKeyRR5Focused := BuildRoundRectCacheWithPath(KW, KH5, FTargetBg, FColLayoutBg, FColKeyBgFocused, True, KeyPath5);
+    finally
+      if KeyPath4 <> nil then KeyPath4.Free;
+      if KeyPath5 <> nil then KeyPath5.Free;
+    end;
+
+    FCacheKeyW           := KW;
+    FCacheKeyH4          := KH4;
+    FCacheKeyH5          := KH5;
+    FCacheKeyColDefault  := FColKeyBg;
+    FCacheKeyColFocused  := FColKeyBgFocused;
+    FCacheRadiusKey      := FRadiusFracKey;
     FCacheKeyMarginYFrac := FKeyMarginYFrac;
-  end
-  else if (KW <= 0) or (LH <= 0) then
-  begin
-    if FCacheKeyRR4Default <> nil then FreeAndNil(FCacheKeyRR4Default);
-    if FCacheKeyRR4Focused <> nil then FreeAndNil(FCacheKeyRR4Focused);
-    if FCacheKeyRR5Default <> nil then FreeAndNil(FCacheKeyRR5Default);
-    if FCacheKeyRR5Focused <> nil then FreeAndNil(FCacheKeyRR5Focused);
+  End
+    else
+  If (KW <= 0) or (LH <= 0) then
+  Begin
+    if FCacheKeyRR4Default <> nil then
+      FreeAndNil(FCacheKeyRR4Default);
+    if FCacheKeyRR4Focused <> nil then
+      FreeAndNil(FCacheKeyRR4Focused);
+    if FCacheKeyRR5Default <> nil then
+      FreeAndNil(FCacheKeyRR5Default);
+    if FCacheKeyRR5Focused <> nil then
+      FreeAndNil(FCacheKeyRR5Focused);
 
     FCacheKeyW := 0;
     FCacheKeyH4 := 0;
     FCacheKeyH5 := 0;
-  end;
+  End;
+  {$IFDEF TRACEDEBUG}DebugMSGFT(VKLogFile,'EnsureCaches (after)');{$ENDIF}
 end;
 
 
@@ -879,10 +1024,12 @@ procedure TVKRenderer.FreeTextResources;
 begin
   // cached GDI+ font/format/brush resources.
   if FKeyBrush <> nil then FreeAndNil(FKeyBrush);
+  if FKeyBrushFocused <> nil then FreeAndNil(FKeyBrushFocused);
   if FKeyFmt <> nil then FreeAndNil(FKeyFmt);
   if FKeyFont <> nil then FreeAndNil(FKeyFont);
   FKeyFontPxCache := 0;
   FillChar(FKeyFontColorCache, SizeOf(FKeyFontColorCache), 0);
+  FillChar(FKeyFontFocusedColorCache, SizeOf(FKeyFontFocusedColorCache), 0);
 
   if FInputBrushSelBg <> nil then FreeAndNil(FInputBrushSelBg);
   if FInputBrushSel <> nil then FreeAndNil(FInputBrushSel);
@@ -922,6 +1069,13 @@ begin
     if FKeyBrush <> nil then FreeAndNil(FKeyBrush);
     FKeyBrush := TGPSolidBrush.Create(GPColor(FColKeyFont));
     FKeyFontColorCache := FColKeyFont;
+  end;
+
+  if (FKeyBrushFocused = nil) or (not SameRGBA(FKeyFontFocusedColorCache, FColKeyFontFocused)) then
+  begin
+    if FKeyBrushFocused <> nil then FreeAndNil(FKeyBrushFocused);
+    FKeyBrushFocused := TGPSolidBrush.Create(GPColor(FColKeyFontFocused));
+    FKeyFontFocusedColorCache := FColKeyFontFocused;
   end;
 end;
 
@@ -972,7 +1126,7 @@ end;
 
 { TVKRenderer }
 
-constructor TVKRenderer.Create;
+constructor TVKRenderer.Create(const Focus : TVKFocus; ShowCancelButton: Boolean = False);
 begin
   inherited Create;
 
@@ -983,8 +1137,8 @@ begin
   SetRectEmpty(FInputRect);
 
   // Default layout fractions (tuned for typical 1080p-ish UI)
-  FKeyMarginXFrac   := 0.005;
-  FKeyMarginYFrac   := 0.014;
+  FKeyMarginXFrac   := 0.006;
+  FKeyMarginYFrac   := 0.018;
   FKeyPadXFrac      := 0.020;
   FKeyPadYFrac      := 0.020;
 
@@ -996,14 +1150,22 @@ begin
   FRadiusFracInput  := 0.25;
   FRadiusFracKey    := 0.25;
 
+  // Double click to select
+  FLastClickTick := 0;
+  FLastClickPos := Point(-32768, -32768);
+  FLastClickInInput := False;
+
   // Default colors
-  FColLayoutBg        := RGBA(255, 0,   0,   128);
-  FColInputBg         := RGBA(0,   0,   255, 128);
-  FColInputBgInactive := RGBA(0,   0,   255, 48);
+  FColLayoutBg        := RGBA( 12,  12,  12, 128);
+  FColInputBg         := RGBA( 32,  40,  72, 160);
+  FColInputBgInactive := RGBA( 48,  48,  48,  64);
   FColInputFont       := RGBA(255, 255, 255, 255);
-  FColKeyBg           := RGBA(128, 128, 128, 96);
-  FColKeyFont         := RGBA(192, 255, 192, 255);
-  FColSelBg           := RGBA(80, 140, 255, 160);
+  FColKeyBg           := RGBA( 96,  96,  96, 128);
+  //FColKeyBgFocused    := RGBA(128, 128, 128, 160);
+  FColKeyBgFocused    := RGBA( 32,  96, 192, 176);
+  FColKeyFont         := RGBA(212, 212, 212, 212);
+  FColKeyFontFocused  := RGBA(255, 255, 255, 212);
+  FColSelBg           := RGBA( 64, 160, 255, 128);
   FColSelFont         := RGBA(255, 255, 255, 255);
   FCaretColor         := RGBA(255, 192, 192, 192);
 
@@ -1012,9 +1174,11 @@ begin
 
   FPage  := vpLetters;
   FShift := False;
+  FShowCancelButton := ShowCancelButton;
+  FClosing := False;
 
   // Default focus starts in input field; no highlighted key yet.
-  FFocus := vfInput;
+  FFocus := Focus;
   FFocusedKeyIdx := -1;
   FActiveKeyIndex := -1;
 
@@ -1034,7 +1198,7 @@ begin
 
   FScrollX := 0;
 
-  FCaretVisible := True;
+  FCaretVisible := FFocus = vfInput;
   FCaretBlinkStartTick := 0;
   FCaretBlinkTogglesLeft := 0;
   FCaretLastToggleTick := 0;
@@ -1052,8 +1216,10 @@ begin
   FKeyFont := nil;
   FKeyFmt := nil;
   FKeyBrush := nil;
+  FKeyBrushFocused := nil;
   FKeyFontPxCache := 0;
   FillChar(FKeyFontColorCache, SizeOf(FKeyFontColorCache), 0);
+  FillChar(FKeyFontFocusedColorCache, SizeOf(FKeyFontFocusedColorCache), 0);
 
   FInputFont := nil;
   FInputFmt := nil;
@@ -1090,7 +1256,7 @@ begin
 end;
 
 
-procedure TVKRenderer.SetTargetBitmap(ABitmap: TBitmap; const ABackground: TRGBAColor);
+procedure TVKRenderer.SetTargetBitmap(ABitmap: TBitmap; const ABackground: TRGBAColor; UpdateCache : Boolean);
 begin
   FBitmap := ABitmap;
   FBitmap.Canvas.Lock;
@@ -1100,27 +1266,42 @@ begin
   FGDIPGraphics := TGPGraphics.Create(FBitmap.Canvas.Handle);
 
   // Cache sizes depend on rects, not bitmap, but caller typically sets bitmap before drawing.
-  EnsureCaches;
+  If UpdateCache = True then
+    EnsureCaches;
 end;
 
 
-procedure TVKRenderer.SetKeyLayoutRect(const R: TRect);
+procedure TVKRenderer.SetKeyLayoutRect(const R: TRect; UpdateCache : Boolean);
 begin
   FKeyLayoutRect := R;
   MarkLayoutDirty;
 
   // Layout and key caches depend on this rect.
-  EnsureCaches;
+  If UpdateCache = True then
+    EnsureCaches;
 end;
 
 
-procedure TVKRenderer.SetInputRect(const R: TRect);
+function TVKRenderer.GetLayoutRect : TRect;
+begin
+  Result := FKeyLayoutRect;
+end;
+
+
+procedure TVKRenderer.SetInputRect(const R: TRect; UpdateCache : Boolean);
 begin
   FInputRect := R;
   FWidthCacheValid := False;
 
   // Input caches depend on this rect.
-  EnsureCaches;
+  If UpdateCache = True then
+    EnsureCaches;
+end;
+
+
+function TVKRenderer.GetInputRect : TRect;
+begin
+  Result := FInputRect;
 end;
 
 
@@ -1294,6 +1475,8 @@ var
 
     NewKey(kkSymbols, 1.2, WideString('123'), '', 0);
     NewKey(kkSpace, 4.0, WideString(''), WideString(' '), 0);
+    if FShowCancelButton then
+      NewKey(kkCancel, 1.6, WideString(#$2715), '', 0);
 
     NewKey(kkSubmit, 1.6, UTF8StringToWideString(#$e2#$a4#$b7), '', 0); // Enter
   end;
@@ -1343,6 +1526,8 @@ var
     NewKey(kkSymbols, 1.2, WideString('ABC'), '', 0);
     NewKey(kkChar, 1.2, WideString('#+='), '', 0); // toggles to symbols2 via handler (see click)
     NewKey(kkSpace, 3.6, WideString(''), WideString(' '), 0);
+    if FShowCancelButton then
+      NewKey(kkCancel, 1.6, WideString(#$2715), '', 0);
     NewKey(kkSubmit, 1.6, UTF8StringToWideString(#$e2#$a4#$b7), '', 0);
   end;
 
@@ -1390,6 +1575,8 @@ var
     NewKey(kkSymbols, 1.2, WideString('ABC'), '', 0);
     NewKey(kkChar, 1.2, WideString('123'), '', 0); // toggles to symbols1 via handler
     NewKey(kkSpace, 3.6, WideString(''), WideString(' '), 0);
+    if FShowCancelButton then
+      NewKey(kkCancel, 1.6, WideString(#$2715), '', 0);
     NewKey(kkSubmit, 1.6, UTF8StringToWideString(#$e2#$a4#$b7), '', 0);
   end;
 
@@ -1515,8 +1702,8 @@ begin
   MarginY := Max(0, FKeyMarginYFrac) * H;
 
   // Decide rows based on page and key model:
-  // vpLetters has 5 rows (11,10,9,11, up to 4 keys bottom depending on multi layout)
-  // vpSymbols pages are 4 rows (11,10,10,4 or 5)
+  // vpLetters has 5 rows (11,10,9,11, bottom depends on multi layout and cancel)
+  // vpSymbols pages are 4 rows (11,10,10, bottom depends on multi layout and cancel)
   if FPage = vpLetters then Rows := 5 else Rows := 4;
 
   RowH := Round((H - (MarginY * (Rows + 1))) / Rows);
@@ -1532,11 +1719,21 @@ begin
     LayoutRow(Idx,  9, CurY, RowH); CurY := CurY + RowH + MarginY;
     LayoutRow(Idx, 11, CurY, RowH); CurY := CurY + RowH + MarginY;
 
-    // Bottom: either 4 keys or 3 keys (no ??)
+    // Bottom: language key and cancel button are optional.
     if HasMultipleLayouts then
-      LayoutRow(Idx, 4, CurY, RowH)
+    begin
+      if FShowCancelButton then
+        LayoutRow(Idx, 5, CurY, RowH)
+      else
+        LayoutRow(Idx, 4, CurY, RowH);
+    end
     else
-      LayoutRow(Idx, 3, CurY, RowH);
+    begin
+      if FShowCancelButton then
+        LayoutRow(Idx, 4, CurY, RowH)
+      else
+        LayoutRow(Idx, 3, CurY, RowH);
+    end;
   end
   else
   begin
@@ -1545,11 +1742,21 @@ begin
     LayoutRow(Idx, 10, CurY, RowH); CurY := CurY + RowH + MarginY;
     LayoutRow(Idx, 10, CurY, RowH); CurY := CurY + RowH + MarginY;
 
-    // Bottom: depending on multi layout, row count differs
+    // Bottom: language key and cancel button are optional.
     if HasMultipleLayouts then
-      LayoutRow(Idx, 5, CurY, RowH)
+    begin
+      if FShowCancelButton then
+        LayoutRow(Idx, 6, CurY, RowH)
+      else
+        LayoutRow(Idx, 5, CurY, RowH);
+    end
     else
-      LayoutRow(Idx, 4, CurY, RowH);
+    begin
+      if FShowCancelButton then
+        LayoutRow(Idx, 5, CurY, RowH)
+      else
+        LayoutRow(Idx, 4, CurY, RowH);
+    end;
   end;
 
   // Any remaining keys (safety): set to zero-size so they won't draw
@@ -1658,7 +1865,9 @@ begin
   if (TxtRect.Width <= 0) or (TxtRect.Height <= 0) then Exit;
 
   // Center text inside key
-  G.DrawString(Key.Text, Length(Key.Text), FKeyFont, TxtRect, FKeyFmt, FKeyBrush);
+  If IsFocused = True then
+    G.DrawString(Key.Text, Length(Key.Text), FKeyFont, TxtRect, FKeyFmt, FKeyBrushFocused) else
+    G.DrawString(Key.Text, Length(Key.Text), FKeyFont, TxtRect, FKeyFmt, FKeyBrush);
 end;
 
 
@@ -1670,11 +1879,16 @@ var
   K: TVKKey;
   DestRect: TGPRectF;
 begin
+  if FClosing then Exit;
   if (FBitmap = nil) then Exit;
   if (RectW(FKeyLayoutRect) <= 0) or (RectH(FKeyLayoutRect) <= 0) then Exit;
 
   // IMPORTANT: Caller should redraw the background bitmap portion here before drawing overlays.
   // Example: RedrawBackgroundArea(FKeyLayoutRect);
+
+  FGDIPGraphics.SetSmoothingMode(SmoothingModeAntiAlias);
+  FGDIPGraphics.SetCompositingQuality(CompositingQualityHighQuality);
+  FGDIPGraphics.SetTextRenderingHint(TextRenderingHintAntiAlias);
 
   if FLayoutDirty then
   begin
@@ -1686,10 +1900,6 @@ begin
 
   // Ensure cached round-rect bitmaps exist before drawing.
   EnsureCaches;
-
-  FGDIPGraphics.SetSmoothingMode(SmoothingModeAntiAlias);
-  FGDIPGraphics.SetCompositingQuality(CompositingQualityHighQuality);
-  FGDIPGraphics.SetTextRenderingHint(TextRenderingHintAntiAlias);
 
   LayoutRF := RectToGPRectF(FKeyLayoutRect);
 
@@ -1708,7 +1918,7 @@ begin
   // Cache GDI+ font/format/brush across frames.
   EnsureKeyTextResources(KeyFontPx);
 
-  for I := 0 to FKeys.Count - 1 do
+  for I := 0 to FKeys.Count-1 do
   begin
     K := FKeys[I];
     if (K.RectF.Width > 0) and (K.RectF.Height > 0) then
@@ -1962,6 +2172,25 @@ begin
 end;
 
 
+procedure TVKRenderer.SetText(const Value: WideString);
+var
+  Changed: Boolean;
+begin
+  Changed := FText <> Value;
+
+  FText := Value;
+  FCaretPos := Length(FText);
+  FMouseSelecting := False;
+  ClearSelection;
+  FScrollX := 0;
+  FWidthCacheValid := False;
+  FCaretVisible := True;
+
+  if Changed and Assigned(FOnTextChanged) then
+    FOnTextChanged(Self, FText);
+end;
+
+
 procedure TVKRenderer.ReplaceSelection(const S: WideString);
 begin
   if HasSelection then
@@ -2005,6 +2234,7 @@ procedure TVKRenderer.TickCaretBlink;
 const
   FAST_TOGGLE_MS = 90;
 begin
+  if FClosing then Exit;
   if FCaretBlinkTogglesLeft <= 0 then Exit;
 
   if GetTickCount - FCaretLastToggleTick >= FAST_TOGGLE_MS then
@@ -2090,6 +2320,7 @@ var
   TextRect: TGPRectF;
   DestRect: TGPRectF;
 begin
+  if FClosing then Exit;
   if (FBitmap = nil) then Exit;
   if (RectW(FInputRect) <= 0) or (RectH(FInputRect) <= 0) then Exit;
 
@@ -2299,14 +2530,25 @@ var
   K: TVKKey;
   KIdx: Integer;
 begin
+  if FClosing then Exit;
   if Button <> mbLeft then Exit;
   if (FBitmap = nil) then Exit;
 
   // Input field click?
   if PtInRect(FInputRect, Point(X, Y)) then
   begin
+    // Double-click in input selects all text
+    if IsInputDoubleClick(X, Y) then
+    begin
+      SetFocus(vfInput);
+      SetSelection(0, Length(FText));
+      FMouseSelecting := False;
+      Exit;
+    end;
+
     // mouse click sets focus to input.
     SetFocus(vfInput);
+
 
     InputRF := RectToGPRectF(FInputRect);
     MarginX := Max(0, FInputMarginXFrac) * InputRF.Width;
@@ -2332,6 +2574,9 @@ begin
     Exit;
   end;
 
+  // Any click outside the input cancels input double-click tracking
+  FLastClickInInput := False;
+
   // Keyboard area click?
   if PtInRect(FKeyLayoutRect, Point(X, Y)) then
   begin
@@ -2354,6 +2599,7 @@ begin
     end;
 
     ActivateKey(K);
+    if FClosing then Exit;
     Exit;
   end;
 end;
@@ -2365,6 +2611,7 @@ var
   MarginX: Single;
   LocalX: Single;
 begin
+  if FClosing then Exit;
   if not FMouseSelecting then Exit;
   if (FBitmap = nil) then Exit;
   if not PtInRect(FInputRect, Point(X, Y)) then Exit;
@@ -2393,6 +2640,7 @@ end;
 
 procedure TVKRenderer.MouseUp(X, Y: Integer; Button: TMouseButton);
 begin
+  if FClosing then Exit;
   if Button <> mbLeft then Exit;
   FMouseSelecting := False;
 end;
@@ -2401,6 +2649,7 @@ procedure TVKRenderer.KeyDown(var Key: Word; Shift: TShiftState);
 var
   ExtendSel: Boolean;
 begin
+  if FClosing then Exit;
   // Ctrl shortcuts for the input area:
   // - Ctrl+A select all
   // - Ctrl+C copy
@@ -2523,9 +2772,9 @@ begin
         Key := 0;
       end;
 
-    VK_UP, VK_DOWN:
+    VK_DOWN:
       begin
-        // Switch focus to key layout and pick the key closest to the caret.
+        // Input -> keys: choose TOP row key closest to caret X
         SetFocus(vfKeys);
 
         if FLayoutDirty then
@@ -2534,7 +2783,22 @@ begin
           LayoutKeysIntoRect;
         end;
 
-        FocusKeyClosestToCaret;
+        FocusKeyClosestToCaret(0);
+        Key := 0;
+      end;
+
+    VK_UP:
+      begin
+        // Input -> keys: choose BOTTOM row key closest to caret X
+        SetFocus(vfKeys);
+
+        if FLayoutDirty then
+        begin
+          BuildKeysForCurrentState;
+          LayoutKeysIntoRect;
+        end;
+
+        FocusKeyClosestToCaret(GetRowCount - 1);
         Key := 0;
       end;
 
@@ -2657,7 +2921,10 @@ begin
 end;
 
 procedure TVKRenderer.WideKeyPress(var Key: WideChar);
+var
+  keyOrd : Word;
 begin
+  if FClosing then Exit;
   if Key = #0 then Exit;
 
   // Fix "Enter twice removes highlight":
@@ -2671,7 +2938,15 @@ begin
 
   // Do NOT switch focus to input for control characters.
   // Previously SetFocus(vfInput) happened before this check and could steal focus on #13.
-  if Ord(Key) < 32 then
+  keyOrd := Ord(Key);
+  if (keyOrd = VK_BACK) and (FFocus = vfKeys) then
+  begin
+    // Special case for backspace
+    SetFocus(vfInput);
+    KeyDown(keyOrd,[]);
+  end;
+
+  if (keyOrd < 32) then
   begin
     Key := #0;
     Exit;
@@ -2793,8 +3068,19 @@ begin
   end
   else
   begin
+    if FFocus = vfNone then
+      FCaretVisible := False;
     EnsureFocusedKeyValid;
   end;
+end;
+
+
+procedure TVKRenderer.SetShowCancelButton(Value: Boolean);
+begin
+  if FShowCancelButton = Value then Exit;
+
+  FShowCancelButton := Value;
+  MarkLayoutDirty;
 end;
 
 
@@ -2899,6 +3185,8 @@ begin
       Counts[4] := 4
     else
       Counts[4] := 3;
+    if FShowCancelButton then
+      Inc(Counts[4]);
   end
     else
   begin
@@ -2909,6 +3197,8 @@ begin
       Counts[3] := 5
     else
       Counts[3] := 4;
+    if FShowCancelButton then
+      Inc(Counts[3]);
   end;
 
   if Row < 0 then Row := 0;
@@ -2978,89 +3268,54 @@ begin
 end;
 
 
-procedure TVKRenderer.FocusKeyClosestToCaret;
+procedure TVKRenderer.FocusKeyClosestToCaret(TargetRow: Integer);
 var
-  InputRF: TGPRectF;
   FontPx: Integer;
-  MarginX, MarginY: Single;
-  ClipRect: TGPRectF;
-  CaretScreenX, CaretScreenY: Single;
-  I: Integer;
-  K: TVKKey;
-  Kcx, Kcy: Single;
-  Dx, Dy: Double;
-  Dist: Double;
-  BestIdx: Integer;
-  BestDist: Double;
-  NeedMeasure: Boolean;
+  InputRF: TGPRectF;
+  MarginX: Single;
+  CaretScreenX: Single;
+  Rows: Integer;
+  Row: Integer;
+  Idx: Integer;
 begin
-  EnsureFocusedKeyValid;
-
-  if (FBitmap = nil) then Exit;
-  if (FKeys.Count = 0) then Exit;
-
-  if FLayoutDirty then
+  // Need keys laid out to have valid RectF.
+  if (FKeys.Count = 0) or (not AnyKeyHasLayout) then
   begin
-    BuildKeysForCurrentState;
-    LayoutKeysIntoRect;
+    EnsureFocusedKeyValid;
+    Exit;
   end;
 
+  Rows := GetRowCount;
+  if Rows <= 0 then Exit;
+
+  Row := ClampI(TargetRow, 0, Rows - 1);
+
+  // Compute caret X on screen (bitmap coords), then choose nearest key in the requested row.
+  // This matches the "nearest to caret position" behavior you already have.
   InputRF := RectToGPRectF(FInputRect);
   MarginX := Max(0, FInputMarginXFrac) * InputRF.Width;
-  MarginY := Max(0, FInputMarginYFrac) * InputRF.Height;
-
   FontPx := Round(Max(10, InputRF.Height * 0.48));
 
-  // Cache font/fmt/brushes; only create a graphics object if measuring is required.
   EnsureInputTextResources(FontPx);
 
-  ClipRect.X := InputRF.X + MarginX;
-  ClipRect.Y := InputRF.Y + MarginY * 0.1;
-  ClipRect.Width := Max(0, InputRF.Width - MarginX * 2);
-  ClipRect.Height := Max(0, InputRF.Height - MarginY * 0.2);
-
-  NeedMeasure := (not FWidthCacheValid) or (Abs(FWidthCacheFontPx - FontPx) > 0.01);
-
-  // Ensure caret is visible by adjusting horizontal scroll
-  EnsureCaretInView(FGDIPGraphics, FontPx, FInputFont, FInputFmt);
-
+  // Ensure width cache so CaretIndexToX works
   if (not FWidthCacheValid) or (Abs(FWidthCacheFontPx - FontPx) > 0.01) then
   begin
-    RebuildWidthCache(FGDIPGraphics, FontPx, FInputFont, FInputFmt);
+    if (FGDIPGraphics <> nil) and (FInputFont <> nil) and (FInputFmt <> nil) then
+      RebuildWidthCache(FGDIPGraphics, FontPx, FInputFont, FInputFmt);
   end;
 
-  CaretScreenX := (ClipRect.X - FScrollX) + CaretIndexToX(FontPx, FCaretPos);
-  CaretScreenY := ClipRect.Y + (ClipRect.Height * 0.5);
+  // Screen X of caret: left + margin + (caretX - scroll)
+  CaretScreenX := FInputRect.Left + MarginX + (CaretIndexToX(FontPx, FCaretPos) - FScrollX);
 
-  BestIdx := -1;
-  BestDist := 1.0e100;
-
-  for I := 0 to FKeys.Count - 1 do
+  Idx := FindClosestKeyInRow(Row, CaretScreenX);
+  if (Idx >= 0) and (Idx < FKeys.Count) then
   begin
-    K := TVKKey(FKeys[I]);
-    if (K.RectF.Width <= 0) or (K.RectF.Height <= 0) then Continue;
-
-    Kcx := K.RectF.X + (K.RectF.Width * 0.5);
-    Kcy := K.RectF.Y + (K.RectF.Height * 0.5);
-
-    Dx := Kcx - CaretScreenX;
-    Dy := Kcy - CaretScreenY;
-
-    Dist := (Dx * Dx) + (Dy * Dy);
-    if Dist < BestDist then
-    begin
-      BestDist := Dist;
-      BestIdx := I;
-    end;
-  end;
-
-  if BestIdx >= 0 then
-  begin
-    FFocusedKeyIdx := BestIdx;
-    FActiveKeyIndex := FFocusedKeyIdx;
-  end;
-
-  EnsureFocusedKeyValid;
+    FFocusedKeyIdx := Idx;
+    FActiveKeyIndex := Idx;
+  end
+  else
+    EnsureFocusedKeyValid;
 end;
 
 
@@ -3116,27 +3371,70 @@ end;
 
 procedure TVKRenderer.MoveFocusedKeyLeftRight(DeltaCol: Integer);
 var
-  CurRow: Integer;
-  StartIdx, Cnt: Integer;
-  Rel: Integer;
-  NewRel: Integer;
+  CurRow, RowCount: Integer;
+  RowStart, RowCnt: Integer;
+  NewStart, NewCnt: Integer;
 begin
+  if FFocus <> vfKeys then Exit;
+
+  // Ensure layout exists
+  if FLayoutDirty then
+  begin
+    BuildKeysForCurrentState;
+    LayoutKeysIntoRect;
+  end;
+
   EnsureFocusedKeyValid;
   if (FFocusedKeyIdx < 0) or (FFocusedKeyIdx >= FKeys.Count) then Exit;
 
   CurRow := GetKeyRowFromIndex(FFocusedKeyIdx);
-  GetRowStartCount(CurRow, StartIdx, Cnt);
-  if Cnt <= 0 then Exit;
+  if CurRow < 0 then Exit;
 
-  Rel := FFocusedKeyIdx - StartIdx;
-  NewRel := Rel + DeltaCol;
+  GetRowStartCount(CurRow, RowStart, RowCnt);
+  if RowCnt <= 0 then Exit;
 
-  if NewRel < 0 then NewRel := 0;
-  if NewRel >= Cnt then NewRel := Cnt - 1;
+  if DeltaCol < 0 then
+  begin
+    // At start of row: jump to end of previous row.
+    // At top-left most key: go to input field.
+    if FFocusedKeyIdx <= RowStart then
+    begin
+      if CurRow <= 0 then
+      begin
+        SetFocus(vfInput);
+        Exit;
+      end;
 
-  FFocusedKeyIdx := StartIdx + NewRel;
+      GetRowStartCount(CurRow - 1, NewStart, NewCnt);
+      if NewCnt > 0 then
+        FFocusedKeyIdx := NewStart + NewCnt - 1;
+    end
+    else
+      Dec(FFocusedKeyIdx);
+  end
+  else if DeltaCol > 0 then
+  begin
+    // At end of row: jump to start of next row.
+    // At bottom-right most key: go to input field.
+    if FFocusedKeyIdx >= (RowStart + RowCnt - 1) then
+    begin
+      RowCount := GetRowCount;
+      if (RowCount > 0) and (CurRow >= RowCount - 1) then
+      begin
+        SetFocus(vfInput);
+        Exit;
+      end;
+
+      GetRowStartCount(CurRow + 1, NewStart, NewCnt);
+      if NewCnt > 0 then
+        FFocusedKeyIdx := NewStart;
+    end
+    else
+      Inc(FFocusedKeyIdx);
+  end;
+
+  // Remember last active key so Tab/focus switching preserves it
   FActiveKeyIndex := FFocusedKeyIdx;
-  EnsureFocusedKeyValid;
 end;
 
 
@@ -3220,6 +3518,7 @@ end;
 
 procedure TVKRenderer.ActivateKey(K: TVKKey);
 begin
+  if FClosing then Exit;
   if K = nil then Exit;
 
   // Preserve highlight on the key being activated, even if it triggers a rebuild.
@@ -3291,6 +3590,14 @@ begin
       begin
         if Assigned(FOnSubmit) then
           FOnSubmit(Self, FText);
+        if FClosing then Exit;
+      end;
+
+    kkCancel:
+      begin
+        if Assigned(FOnCancel) then
+          FOnCancel(Self, FText);
+        if FClosing then Exit;
       end;
 
     kkLang:
@@ -3299,11 +3606,314 @@ begin
       end;
   end;
 
+  if FClosing then Exit;
+
   // If activation did NOT rebuild the keyboard, ensure highlight stays on the same key.
   // If it DID rebuild, ApplyPendingFocusIfAny will run inside LayoutKeysIntoRect on next draw.
   if (FFocus = vfKeys) and (not FLayoutDirty) then
     EnsureFocusedKeyValid;
 end;
+
+
+function TVKRenderer.GetCurrentKLID: AnsiString;
+var
+  Buf: array[0..KL_NAMELENGTH - 1] of Char; // KL_NAMELENGTH = 9 (8 chars + #0)
+begin
+  FillChar(Buf, SizeOf(Buf), 0);
+  if GetKeyboardLayoutName(Buf) then
+    Result := AnsiString(Buf)
+  else
+    Result := '';
+end;
+
+
+function TVKRenderer.FindInstalledHKLByKLID(const KLID: AnsiString; out Found: HKL): Boolean;
+var
+  I: Integer;
+  PrevHKL: HKL;
+  Buf: array[0..KL_NAMELENGTH - 1] of Char;
+  CurKLID: AnsiString;
+begin
+  Result := False;
+  Found := 0;
+
+  if KLID = '' then Exit;
+
+  // Make sure we are working with the latest installed list
+  RefreshInstalledLayouts;
+  if FHKLCount <= 0 then Exit;
+
+  PrevHKL := GetKeyboardLayout(0);
+  try
+    for I := 0 to FHKLCount - 1 do
+    begin
+      ActivateKeyboardLayout(FHKLs[I], 0);
+
+      FillChar(Buf, SizeOf(Buf), 0);
+      if GetKeyboardLayoutName(Buf) then
+        CurKLID := AnsiString(Buf)
+      else
+        CurKLID := '';
+
+      if SameText(string(CurKLID), string(KLID)) then
+      begin
+        Found := FHKLs[I];
+        Result := True;
+        Exit;
+      end;
+    end;
+  finally
+    // Restore previous HKL to avoid side effects if we did not find a match.
+    ActivateKeyboardLayout(PrevHKL, 0);
+  end;
+end;
+
+
+function TVKRenderer.ResolveHKLFromState(State: TVKRendererState): HKL;
+var
+  I: Integer;
+  H: HKL;
+  Cur: HKL;
+  LangID: Word;
+begin
+  Result := 0;
+  if State = nil then Exit;
+
+  RefreshInstalledLayouts;
+
+  if FHKLCount <= 0 then
+  begin
+    Result := CurrentHKL;
+    Exit;
+  end;
+
+  // 1) Exact HKL handle still present
+  for I := 0 to FHKLCount - 1 do
+    if FHKLs[I] = State.SavedHKL then
+    begin
+      Result := FHKLs[I];
+      Exit;
+    end;
+
+  // 2) KLID match (robust across sessions where HKL handles differ)
+  if (State.SavedKLID <> '') and FindInstalledHKLByKLID(State.SavedKLID, H) then
+  begin
+    Result := H;
+    Exit;
+  end;
+
+  // 3) LANGID match (LOWORD(HKL)) as weaker fallback
+  LangID := State.SavedLangID;
+  if LangID <> 0 then
+  begin
+    for I := 0 to FHKLCount - 1 do
+      if Word(Longint(FHKLs[I]) and $FFFF) = LangID then
+      begin
+        Result := FHKLs[I];
+        Exit;
+      end;
+  end;
+
+  // 4) Fallback to current if it is in the list, else first installed
+  Cur := CurrentHKL;
+  for I := 0 to FHKLCount - 1 do
+    if FHKLs[I] = Cur then
+    begin
+      Result := Cur;
+      Exit;
+    end;
+
+  Result := FHKLs[0];
+end;
+
+
+function TVKRenderer.SaveState(ForceBuild: Boolean = False): TVKRendererState;
+var
+  S: TVKRendererState;
+  K: TVKKey;
+begin
+  // Optional: make sure key list is current so key signatures reflect the visible keyboard
+  if ForceBuild and FLayoutDirty and (RectW(FKeyLayoutRect) > 0) and (RectH(FKeyLayoutRect) > 0) then
+  begin
+    BuildKeysForCurrentState;
+    LayoutKeysIntoRect;
+  end;
+
+  S := TVKRendererState.Create;
+  S.Version := 1;
+
+  // Layout identity
+  S.SavedHKL    := CurrentHKL;
+  S.SavedLangID := Word(Longint(S.SavedHKL) and $FFFF);
+  S.SavedKLID   := GetCurrentKLID;
+
+  // Keyboard state
+  S.Page  := FPage;
+  S.Shift := FShift;
+  S.Focus := FFocus;
+
+  // Input state
+  S.Text      := FText;
+  S.CaretPos  := FCaretPos;
+  S.SelAnchor := FSelAnchor;
+  S.ScrollX   := FScrollX;
+
+  // Focused key signature
+  S.FocusedKeyValid := False;
+  FillChar(S.FocusedKeySig, SizeOf(S.FocusedKeySig), 0);
+
+  if (FFocusedKeyIdx >= 0) and (FFocusedKeyIdx < FKeys.Count) then
+  begin
+    K := TVKKey(FKeys[FFocusedKeyIdx]);
+    S.FocusedKeySig := MakeKeySignature(K);
+    S.FocusedKeyValid := True;
+  end;
+
+  // Active key signature (remembered even when focus is in input)
+  S.ActiveKeyValid := False;
+  FillChar(S.ActiveKeySig, SizeOf(S.ActiveKeySig), 0);
+
+  if (FActiveKeyIndex >= 0) and (FActiveKeyIndex < FKeys.Count) then
+  begin
+    K := TVKKey(FKeys[FActiveKeyIndex]);
+    S.ActiveKeySig := MakeKeySignature(K);
+    S.ActiveKeyValid := True;
+  end;
+
+  Result := S;
+end;
+
+
+procedure TVKRenderer.RestoreState(State: TVKRendererState; FireEvents: Boolean = False);
+var
+  NewHKL, OldHKL: HKL;
+  L: Integer;
+  Sig: TVKKeySignature;
+  SigValid: Boolean;
+begin
+  if State = nil then Exit;
+
+  // Restore page/shift first (affects BuildKeysForCurrentState and captions)
+  if (Ord(State.Page) >= Ord(Low(TVKPage))) and (Ord(State.Page) <= Ord(High(TVKPage))) then
+    FPage := State.Page
+  else
+    FPage := vpLetters;
+
+  FShift := State.Shift;
+
+  // Restore input model
+  FText := State.Text;
+  L := Length(FText);
+
+  FCaretPos  := ClampI(State.CaretPos, 0, L);
+  FSelAnchor := ClampI(State.SelAnchor, 0, L);
+
+  // Selection derived from anchor/caret
+  NormalizeSelection;
+
+  // Scroll is optional, keep sane
+  FScrollX := State.ScrollX;
+  if FScrollX < 0 then FScrollX := 0;
+
+  // Reset transient interaction flags
+  FMouseSelecting := False;
+  FSwallowNextKeyPress := False;
+  FCaretVisible := True;
+  FCaretBlinkTogglesLeft := 0;
+
+  // Width cache must be rebuilt for new bitmap/font context
+  FWidthCacheValid := False;
+
+  // Restore focus (active control)
+  if (Ord(State.Focus) >= Ord(Low(TVKFocus))) and (Ord(State.Focus) <= Ord(High(TVKFocus))) then
+    FFocus := State.Focus
+  else
+    FFocus := vfInput;
+
+  // Restore layout with fallback
+  RefreshInstalledLayouts;
+  OldHKL := CurrentHKL;
+  NewHKL := ResolveHKLFromState(State);
+
+  if (NewHKL <> 0) and (NewHKL <> OldHKL) then
+  begin
+    ActivateKeyboardLayout(NewHKL, 0);
+    if FireEvents and Assigned(FOnLayoutChanged) then
+      FOnLayoutChanged(Self, NewHKL);
+  end;
+
+  // Decide which key signature should be restored visually/semantically
+  SigValid := False;
+  FillChar(Sig, SizeOf(Sig), 0);
+
+  if (FFocus = vfKeys) and State.FocusedKeyValid then
+  begin
+    Sig := State.FocusedKeySig;
+    SigValid := True;
+  end
+  else if State.ActiveKeyValid then
+  begin
+    Sig := State.ActiveKeySig;
+    SigValid := True;
+  end;
+
+  if SigValid then
+  begin
+    // Apply via existing preservation mechanism (works across rebuilds and layout changes)
+    FPendingFocusSig := Sig;
+    FPendingFocusSigValid := True;
+  end
+  else
+  begin
+    FPendingFocusSigValid := False;
+  end;
+
+  // Force keyboard rebuild so page/shift/layout changes are reflected
+  MarkLayoutDirty;
+
+  // If rects are already known, build now so ActiveKeyIndex is usable immediately (Tab logic etc)
+  if (RectW(FKeyLayoutRect) > 0) and (RectH(FKeyLayoutRect) > 0) then
+  begin
+    BuildKeysForCurrentState;
+    LayoutKeysIntoRect; // will ApplyPendingFocusIfAny + validate focus if vfKeys
+  end;
+
+  // If focus is input, hide highlight but keep the active key remembered
+  if FFocus = vfInput then
+    FFocusedKeyIdx := -1
+  else
+    EnsureFocusedKeyValid;
+end;
+
+
+function TVKRenderer.IsInputDoubleClick(X, Y: Integer): Boolean;
+var
+  NowTick : DWORD;
+  DblTime : DWORD;
+  DX, DY  : Integer;
+begin
+  NowTick := GetTickCount;
+  DblTime := GetDoubleClickTime;
+
+  // System-defined double-click rectangle around the first click
+  DX := GetSystemMetrics(SM_CXDOUBLECLK) div 2;
+  DY := GetSystemMetrics(SM_CYDOUBLECLK) div 2;
+  if DX < 1 then DX := 1;
+  if DY < 1 then DY := 1;
+
+  Result :=
+    FLastClickInInput and
+    (NowTick - FLastClickTick <= DblTime) and
+    (Abs(X - FLastClickPos.X) <= DX) and
+    (Abs(Y - FLastClickPos.Y) <= DY);
+
+  // Update state for next click
+  FLastClickTick := NowTick;
+  FLastClickPos := Point(X, Y);
+  FLastClickInInput := True;
+end;
+
+
 
 end.
 
